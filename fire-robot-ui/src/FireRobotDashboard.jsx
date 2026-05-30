@@ -23,21 +23,22 @@ const TIMEOUT_MS = 4000;
 const CHECK_INTERVAL_MS = 1000;
 const MAX_RECONNECT_ATTEMPTS = 10; // 최대 재연결 시도 횟수
 const DEFAULT_SAMPLE_INTERVAL_MS = 1000;
+const BATTERY_VOLTAGE_TOPIC = "/battery_voltage";
+const INTERNAL_TEMPERATURE_TOPIC = "/robot/internal_temperature";
+const INTERNAL_TEMPERATURE_MESSAGE_TYPE = "std_msgs/msg/Float32";
 const SAMPLE_INTERVAL_OPTIONS = [500, 1000, 2000];
 const TREND_WINDOW_OPTIONS = [16, 32, 64, 120];
 const DEFAULT_TREND_WINDOW = 32;
 const MAX_HISTORY_POINTS = 240;
 const INITIAL_HISTORY_POINTS = 64;
 
-const BATTERY_MIN_V = 0;
-const BATTERY_MAX_V = 15;
-const BATTERY_BASE_V = 11.1;
-const BATTERY_INITIAL_VARIANCE = 0.3;
+const BATTERY_MIN_V = 10.5;
+const BATTERY_MAX_V = 11.5;
 
-const TEMP_MIN_C = 0;
-const TEMP_MAX_C = 100;
-const TEMP_BASE_C = 30;
-const TEMP_INITIAL_VARIANCE = 5;
+const TEMP_MIN_C = 30;
+const TEMP_MAX_C = 50;
+const TEMP_BASE_C = 40;
+const TEMP_INITIAL_VARIANCE = 0.2;
 
 const GRAPH_FRAME = {
   width: 320,
@@ -79,6 +80,7 @@ const TOPIC_CONFIG = [
   { key: "battery_sensor", name: "배터리 상태", topic: "/battery_sensor/status" },
   { key: "motor", name: "모터 상태", topic: "/motor/status" },
   { key: "temperature_sensor", name: "로봇 온도", topic: "/temperature_sensor/status" },
+  { key: "internal_temperature", name: "내부 온도", topic: "/robot/internal_temperature" },
 ];
 
 const createInitialTopicState = () =>
@@ -94,15 +96,10 @@ const createInitialTopicState = () =>
 export default function FireRobotDashboard() {
   const [rosConnected, setRosConnected] = useState(false);
   const [activeTab, setActiveTab] = useState("home");
-  const [thermalReloadKey, setThermalReloadKey] = useState(0);
-  const [thermalImageOk, setThermalImageOk] = useState(false);
-  const [rgbReloadKey, setRgbReloadKey] = useState(0);
-  const [rgbImageOk, setRgbImageOk] = useState(false);
-  const [rvizReloadKey, setRvizReloadKey] = useState(0);
-  const [rvizImageOk, setRvizImageOk] = useState(false);
   const [topicStates, setTopicStates] = useState(createInitialTopicState());
-  const [thermalImageSize, setThermalImageSize] = useState({ width: 0, height: 0 });
   const [maxTemperature, setMaxTemperature] = useState(null);
+  const [batteryVoltage, setBatteryVoltage] = useState(null);
+  const [internalTemperature, setInternalTemperature] = useState(null);
 
   // 재연결 로직용 ref
   const reconnectAttemptRef = useRef(0);
@@ -110,16 +107,7 @@ export default function FireRobotDashboard() {
   const rosInstanceRef = useRef(null);
   const [sampleIntervalMs, setSampleIntervalMs] = useState(DEFAULT_SAMPLE_INTERVAL_MS);
   const [trendWindowPoints, setTrendWindowPoints] = useState(DEFAULT_TREND_WINDOW);
-  const [batterySeries, setBatterySeries] = useState(() =>
-    createInitialSeries(
-      INITIAL_HISTORY_POINTS,
-      BATTERY_BASE_V,
-      BATTERY_INITIAL_VARIANCE,
-      BATTERY_MIN_V,
-      BATTERY_MAX_V,
-      DEFAULT_SAMPLE_INTERVAL_MS
-    )
-  );
+  const [batterySeries, setBatterySeries] = useState([]);
   const [tempSeries, setTempSeries] = useState(() =>
     createInitialSeries(
       INITIAL_HISTORY_POINTS,
@@ -130,6 +118,18 @@ export default function FireRobotDashboard() {
       DEFAULT_SAMPLE_INTERVAL_MS
     )
   );
+
+  useEffect(() => {
+    // debug: log initial temperature series and constants
+    try {
+      // eslint-disable-next-line no-console
+      console.log("[DEBUG] TEMP_BASE_C, TEMP_INITIAL_VARIANCE, TEMP_MIN_C, TEMP_MAX_C", TEMP_BASE_C, TEMP_INITIAL_VARIANCE, TEMP_MIN_C, TEMP_MAX_C);
+      // eslint-disable-next-line no-console
+      console.log("[DEBUG] tempSeries sample:", tempSeries.slice(0, 5).map(s => s.value));
+    } catch (e) {
+      // ignore
+    }
+  }, []);
 
   const logs = [
     { time: "14:21:08", level: "INFO", text: "자율주행 경로 추종 정상 동작" },
@@ -297,6 +297,67 @@ export default function FireRobotDashboard() {
         }
       });
 
+      const batteryVoltageTopic = new ROSLIB.Topic({
+        ros,
+        name: BATTERY_VOLTAGE_TOPIC,
+        messageType: "std_msgs/msg/Float32",
+      });
+
+      batteryVoltageTopic.subscribe((message) => {
+        if (isUnmounted) return;
+
+        const voltage = Number(message.data);
+        if (!Number.isFinite(voltage)) return;
+
+        const now = Date.now();
+        const roundedVoltage = Number(voltage.toFixed(2));
+        const clampedVoltage = clamp(roundedVoltage, BATTERY_MIN_V, BATTERY_MAX_V);
+
+        setBatteryVoltage(clampedVoltage);
+        setBatterySeries((prev) => {
+          const next = {
+            t: now,
+            label: formatTimeLabel(now),
+            value: clampedVoltage,
+          };
+
+          return [...prev.slice(-(MAX_HISTORY_POINTS - 1)), next];
+        });
+      });
+
+      subscribers.push(batteryVoltageTopic);
+
+      // Internal temperature subscriber
+      const internalTempTopic = new ROSLIB.Topic({
+        ros,
+        name: INTERNAL_TEMPERATURE_TOPIC,
+        messageType: INTERNAL_TEMPERATURE_MESSAGE_TYPE,
+      });
+
+      internalTempTopic.subscribe((message) => {
+        if (isUnmounted) return;
+
+        const tempValue = Number(message.data);
+        if (!Number.isFinite(tempValue)) return;
+
+        const now = Date.now();
+        const clampedTemp = clamp(tempValue, TEMP_MIN_C, TEMP_MAX_C);
+        const roundedTemp = Number(clampedTemp.toFixed(1));
+
+        setInternalTemperature(roundedTemp);
+        setTempSeries((prev) => {
+          const next = {
+            t: now,
+            label: formatTimeLabel(now),
+            value: roundedTemp,
+          };
+
+          return [...prev.slice(-(MAX_HISTORY_POINTS - 1)), next];
+        });
+      });
+
+      subscribers.push(internalTempTopic);
+
       timeoutChecker = setInterval(() => {
         const now = Date.now();
 
@@ -355,43 +416,7 @@ export default function FireRobotDashboard() {
     };
   }, []);
 
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const now = Date.now();
-
-      setBatterySeries((prev) => {
-        const lastValue = prev[prev.length - 1]?.value ?? BATTERY_BASE_V;
-        const jitter = (Math.random() * 2 - 1) * 0.06;
-        const restore = (BATTERY_BASE_V - lastValue) * 0.12;
-        const nextValue = clamp(lastValue + jitter + restore, BATTERY_MIN_V, BATTERY_MAX_V);
-
-        const next = {
-          t: now,
-          label: formatTimeLabel(now),
-          value: Number(nextValue.toFixed(2)),
-        };
-
-        return [...prev.slice(-(MAX_HISTORY_POINTS - 1)), next];
-      });
-
-      setTempSeries((prev) => {
-        const lastValue = prev[prev.length - 1]?.value ?? TEMP_BASE_C;
-        const jitter = (Math.random() * 2 - 1) * 1.0;
-        const restore = (TEMP_BASE_C - lastValue) * 0.08;
-        const nextValue = clamp(lastValue + jitter + restore, TEMP_MIN_C, TEMP_MAX_C);
-
-        const next = {
-          t: now,
-          label: formatTimeLabel(now),
-          value: Number(nextValue.toFixed(1)),
-        };
-
-        return [...prev.slice(-(MAX_HISTORY_POINTS - 1)), next];
-      });
-    }, sampleIntervalMs);
-
-    return () => clearInterval(timer);
-  }, [sampleIntervalMs]);
+  // Temperature data is now received from /robot/internal_temperature topic
 
   const iconMap = {
     autonomy: autonomyIcon,
@@ -419,6 +444,22 @@ export default function FireRobotDashboard() {
     const state = topicStates.thermal_camera;
     return state && !state.timedOut && state.value === true;
   }, [topicStates]);
+  const autonomyTopicAlive = useMemo(() => {
+    const state = topicStates.autonomy;
+    return state && !state.timedOut && state.value === true;
+  }, [topicStates]);
+  const rgbTopicAlive = useMemo(() => {
+    const state = topicStates.vision_sensor;
+    return state && !state.timedOut && state.value === true;
+  }, [topicStates]);
+
+  const streamBadgeClass = (isAlive, liveClass) =>
+    isAlive
+      ? `border ${liveClass}`
+      : "border border-slate-400/30 bg-slate-500/15 text-slate-300";
+
+  const streamBadgeText = (isAlive) =>
+    isAlive ? "정상 - 30 FPS" : "0 FPS";
 
   const batteryViewSeries = useMemo(
     () => batterySeries.slice(-trendWindowPoints),
@@ -554,49 +595,22 @@ export default function FireRobotDashboard() {
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-[11px] font-medium text-emerald-300">
-                      15 FPS
-                    </span>
                     <span
-                      className={`rounded-full px-3 py-1 text-xs ${
-                        thermalImageOk
-                          ? "border border-emerald-400/30 bg-emerald-500/15 text-emerald-300"
-                          : "border border-rose-400/30 bg-rose-500/15 text-rose-300"
-                      }`}
+                      className={`rounded-full px-3 py-1 text-[11px] font-medium ${streamBadgeClass(
+                        thermalTopicAlive,
+                        "border-emerald-400/30 bg-emerald-500/15 text-emerald-300"
+                      )}`}
                     >
-                      {thermalImageOk ? "LIVE" : "DISCONNECTED"}
+                      {streamBadgeText(thermalTopicAlive)}
                     </span>
-
-                    <button
-                      onClick={() => {
-                        setThermalImageOk(false);
-                        setThermalReloadKey((v) => v + 1);
-                      }}
-                      className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-200 hover:bg-white/10"
-                    >
-                      재연결
-                    </button>
                   </div>
                 </div>
 
                 <div className={`relative mt-1 aspect-square w-full overflow-hidden bg-black/40 ${glassInsetClass}`}>
                   <img
-                    key={thermalReloadKey}
-                    src={`${thermalStreamUrl}&reload=${thermalReloadKey}`}
+                    src={thermalStreamUrl}
                     alt="ROS2 thermal stream"
                     className="h-full w-full object-contain"
-                    onLoad={(e) => {
-                      const img = e.target;
-                      setThermalImageSize({
-                        width: img.naturalWidth,
-                        height: img.naturalHeight
-                      });
-                      setThermalImageOk(true);
-                    }}
-                    onError={() => {
-                      setThermalImageSize({ width: 0, height: 0 });
-                      setThermalImageOk(false);
-                    }}
                   />
 
                   <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-white/10" />
@@ -640,39 +654,22 @@ export default function FireRobotDashboard() {
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <span
-                      className={`rounded-full border px-3 py-1 text-xs uppercase tracking-wide ${
-                        rvizImageOk
-                          ? "border-emerald-400/30 bg-emerald-500/15 text-emerald-300"
-                          : "border-rose-400/30 bg-rose-500/15 text-rose-300"
-                      }`}
+                      className={`rounded-full px-3 py-1 text-[11px] font-medium ${streamBadgeClass(
+                        autonomyTopicAlive,
+                        "border-cyan-400/30 bg-cyan-500/15 text-cyan-300"
+                      )}`}
                     >
-                      {rvizImageOk ? "RViz LIVE" : "RViz DISCONNECTED"}
+                      {streamBadgeText(autonomyTopicAlive)}
                     </span>
-                    <button
-                      onClick={() => {
-                        setRvizImageOk(false);
-                        setRvizReloadKey((v) => v + 1);
-                      }}
-                      className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-200 hover:bg-white/10"
-                    >
-                      재연결
-                    </button>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-1 gap-3">
                   <div className={`relative aspect-square w-full overflow-hidden ${glassInsetClass}`}>
                     <img
-                      key={rvizReloadKey}
-                      src={`${rvizStreamUrl}&reload=${rvizReloadKey}`}
+                      src={rvizStreamUrl}
                       alt="RViz live stream"
                       className="h-full w-full object-cover"
-                      onLoad={() => {
-                        setRvizImageOk(true);
-                      }}
-                      onError={() => {
-                        setRvizImageOk(false);
-                      }}
                     />
 
                     <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-white/10" />
@@ -700,43 +697,22 @@ export default function FireRobotDashboard() {
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-3 py-1 text-[11px] font-medium text-cyan-300">
-                      정상 - 30 FPS
-                    </span>
                     <span
-                      className={`rounded-full px-3 py-1 text-xs ${
-                        rgbImageOk
-                          ? "border border-emerald-400/30 bg-emerald-500/15 text-emerald-300"
-                          : "border border-rose-400/30 bg-rose-500/15 text-rose-300"
-                      }`}
+                      className={`rounded-full px-3 py-1 text-[11px] font-medium ${streamBadgeClass(
+                        rgbTopicAlive,
+                        "border-sky-400/30 bg-sky-500/15 text-sky-300"
+                      )}`}
                     >
-                      {rgbImageOk ? "LIVE" : "DISCONNECTED"}
+                      {streamBadgeText(rgbTopicAlive)}
                     </span>
-
-                    <button
-                      onClick={() => {
-                        setRgbImageOk(false);
-                        setRgbReloadKey((v) => v + 1);
-                      }}
-                      className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-200 hover:bg-white/10"
-                    >
-                      재연결
-                    </button>
                   </div>
                 </div>
 
                 <div className={`relative aspect-square w-full overflow-hidden ${glassInsetClass}`}>
                   <img
-                    key={rgbReloadKey}
-                    src={`${rgbStreamUrl}&reload=${rgbReloadKey}`}
+                    src={rgbStreamUrl}
                     alt="RGB camera stream"
                     className="h-full w-full object-cover"
-                    onLoad={() => {
-                      setRgbImageOk(true);
-                    }}
-                    onError={() => {
-                      setRgbImageOk(false);
-                    }}
                   />
 
                   <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-white/10" />
@@ -797,7 +773,7 @@ export default function FireRobotDashboard() {
                       <div className="text-right">
                         <div className="text-sm text-slate-400">현재 전압</div>
                         <div className="text-2xl font-semibold text-emerald-300">
-                          {batterySeries[batterySeries.length - 1]?.value.toFixed(2)}V
+                          {batteryVoltage !== null ? `${batteryVoltage.toFixed(2)}V` : "대기중"}
                         </div>
                       </div>
                     </div>
@@ -811,7 +787,7 @@ export default function FireRobotDashboard() {
                           <stop offset="100%" stopColor="#60a5fa" />
                         </linearGradient>
                       </defs>
-                      {[0, 5, 10, 15].map((tick) => {
+                      {[10.5, 11.0, 11.5].map((tick) => {
                         const y = graphY(tick, BATTERY_MIN_V, BATTERY_MAX_V);
                         return (
                           <g key={tick}>
@@ -836,6 +812,17 @@ export default function FireRobotDashboard() {
                           </text>
                         );
                       })}
+                      {batteryViewSeries.length === 0 && (
+                        <text
+                          x="160"
+                          y="86"
+                          textAnchor="middle"
+                          fontSize="12"
+                          fill="rgba(203,213,225,0.75)"
+                        >
+                          /battery_voltage 수신 대기 중
+                        </text>
+                      )}
                       <path
                         d={linePath(batteryViewSeries, BATTERY_MIN_V, BATTERY_MAX_V)}
                         fill="none"
@@ -859,7 +846,7 @@ export default function FireRobotDashboard() {
                       <div className="text-right">
                         <div className="text-sm text-slate-400">현재 온도</div>
                         <div className="text-2xl font-semibold text-amber-300">
-                          {tempSeries[tempSeries.length - 1]?.value.toFixed(1)}°C
+                          {internalTemperature !== null ? `${internalTemperature.toFixed(1)}°C` : "대기중"}
                         </div>
                       </div>
                     </div>
@@ -873,7 +860,7 @@ export default function FireRobotDashboard() {
                           <stop offset="100%" stopColor="#fb7185" />
                         </linearGradient>
                       </defs>
-                      {[0, 20, 40, 60, 80, 100].map((tick) => {
+                      {[30, 35, 40, 45, 50].map((tick) => {
                         const y = graphY(tick, TEMP_MIN_C, TEMP_MAX_C);
                         return (
                           <g key={tick}>
